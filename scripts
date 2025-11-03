@@ -1,0 +1,845 @@
+
+# =========================
+# 0) CONFIG & IMPORTS
+# =========================
+CODE_MAP = {
+    "NPM": ("NP15", "HLH"),
+    "ONP": ("NP15", "LLH"),
+    "SPM": ("SP15", "HLH"),
+    "OFP": ("SP15", "LLH"),
+}
+CATALOG = {
+    'schema'     : 'default',
+    'table'      : 'ice_prices',
+    'out_schema' : 'riskdev',
+}
+import math, numpy as np, pandas as pd
+from datetime import date, timedelta
+import pyspark.sql.functions as F
+from pyspark.sql import Window
+
+# =========================
+# 1) CLEAN & MAP → riskdev.ice_clean_prices
+# =========================
+
+from datetime import date, timedelta
+from pyspark.sql import functions as F
+# Calculate start date (3 years back)
+lookback_years = 3
+start_hist_date = (date.today() - timedelta(days=365 * lookback_years)).isoformat()
+raw = (
+    spark.table(f"{CATALOG['schema']}.{CATALOG['table']}")
+    # Limit historical window
+    .where(F.col("EFFECTIVE_DATE") >= F.lit(start_hist_date))
+    .select(
+        "STREAM_ID",
+        F.col("EFFECTIVE_DATE").cast("date").alias("quote_date"),
+        F.col("CONTRACT_START").cast("date").alias("contract_start"),
+        F.col("SETTLE").cast("double").alias("settle"),
+        "COMMODITY_CODE"
+    )
+    .where(
+        (F.col("settle").isNotNull())
+        & (F.col("COMMODITY_CODE").isin("NPM", "SPM", "ONP", "OFP"))
+        & (F.col("CONTRACT_START").isNotNull())
+    )
+)
+hub_col = (F.when(F.col("COMMODITY_CODE")=="NPM","NP15")
+             .when(F.col("COMMODITY_CODE")=="ONP","NP15")
+             .when(F.col("COMMODITY_CODE")=="SPM","SP15")
+             .when(F.col("COMMODITY_CODE")=="OFP","SP15"))
+tou_col = (F.when(F.col("COMMODITY_CODE")=="NPM","HLH")
+             .when(F.col("COMMODITY_CODE")=="ONP","LLH")
+             .when(F.col("COMMODITY_CODE")=="SPM","HLH")
+             .when(F.col("COMMODITY_CODE")=="OFP","LLH"))
+             
+# tenor_m should be positive for future deliveries (0 if already delivered)
+
+clean = (
+    raw.withColumn("hub", hub_col)
+        .withColumn("tou", tou_col)
+        .withColumn("delivery_month", F.trunc("contract_start", "MONTH"))
+        .withColumn("moy", F.month("contract_start"))
+        .withColumn(
+            "tenor_m",
+            F.when(
+                F.months_between(F.col("delivery_month"), F.col("quote_date")) >= 0,
+                F.months_between(F.col("delivery_month"), F.col("quote_date"))
+            ).otherwise(0.0)
+        )
+)
+
+
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG['out_schema']}.ice_clean_prices")
+clean.write.mode("overwrite").saveAsTable(f"{CATALOG['out_schema']}.ice_clean_prices")
+display(clean)
+display(clean.select(F.min("quote_date").alias("min_quote"), F.max("quote_date").alias("max_quote")))
+display(
+    spark.table(f"{CATALOG['out_schema']}.ice_clean_prices")
+          .select("hub", "tou", "quote_date", "delivery_month", "tenor_m")
+          .orderBy(F.desc("tenor_m"))
+          .limit(10)
+)
+
+# =========================
+# 2) SAME-DELIVERY RETURNS -> riskdev.ice_same_delivery_returns
+# =========================
+#returns for the same delivery contract across quote days
+
+prices = spark.table(f"{CATALOG['out_schema']}.ice_clean_prices")
+w = Window.partitionBy("hub","tou","delivery_month").orderBy("quote_date")
+rets = (prices
+    .select("hub","tou","quote_date","delivery_month","moy","tenor_m","settle")
+    .withColumn("settle_lag", F.lag("settle").over(w))
+    .withColumn("ret", F.log(F.col("settle")/F.col("settle_lag")))
+    .where(F.col("ret").isNotNull())
+)
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG['out_schema']}.ice_same_delivery_returns")
+rets.write.mode("overwrite").saveAsTable(f"{CATALOG['out_schema']}.ice_same_delivery_returns")
+display(rets)
+
+# =========================
+# 3) EMPIRICAL VOLS -> ice_emp_vol_tau_moy, ice_emp_vol_tau
+# =========================
+
+emp_vol = (spark.table(f"{CATALOG['out_schema']}.ice_same_delivery_returns")
+           .groupBy("hub","tou","tenor_m","moy")
+           .agg(F.sqrt(F.avg((F.col("ret"))**2)).alias("sigma_emp")))
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG['out_schema']}.ice_emp_vol_tau_moy")
+emp_vol.write.mode("overwrite").saveAsTable(f"{CATALOG['out_schema']}.ice_emp_vol_tau_moy")
+emp_vol_t = (emp_vol.groupBy("hub","tou","tenor_m")
+             .agg(F.avg("sigma_emp").alias("sigma_emp_t")))
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG['out_schema']}.ice_emp_vol_tau")
+emp_vol_t.write.mode("overwrite").saveAsTable(f"{CATALOG['out_schema']}.ice_emp_vol_tau")
+
+# =========================
+# 4) CROSS-TENOR CORR BY GAP -> ice_emp_rho_gap
+# =========================
+
+r = spark.table(f"{CATALOG['out_schema']}.ice_same_delivery_returns") \
+         .select("hub","tou","quote_date","tenor_m","ret")
+a = r.alias("a") 
+b = r.select(
+      F.col("hub").alias("hub"),
+      F.col("tou").alias("tou"),
+      F.col("quote_date").alias("quote_date"),
+      F.col("tenor_m").alias("tenor_m_b"),
+      F.col("ret").alias("ret_b")
+    ).alias("b")
+pairs = (a.join(b, on=["hub","tou","quote_date"], how="inner")
+           .where(F.col("a.tenor_m") < F.col("b.tenor_m_b"))
+           .withColumn("gap_m", F.col("b.tenor_m_b") - F.col("a.tenor_m"))
+        )
+rho_gap = (pairs.groupBy("hub","tou","gap_m")
+                .agg(F.corr(F.col("a.ret"), F.col("b.ret_b")).alias("rho_emp")))
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG['out_schema']}.ice_emp_rho_gap")
+rho_gap.write.mode("overwrite").saveAsTable(f"{CATALOG['out_schema']}.ice_emp_rho_gap")
+
+# =========================
+# 5) FIT rho(Δτ) -> ice_param_rho
+# =========================
+
+rho_df = spark.table(f"{CATALOG['out_schema']}.ice_emp_rho_gap").toPandas()
+def fit_rho_gap(gap, rho):
+    m = np.isfinite(rho)
+    gap, rho = gap[m], np.clip(rho[m], 1e-6, 0.999)
+    if len(gap) < 2: return {'lambda': 0.10}
+    lam = - (gap @ np.log(rho)) / (gap @ gap)
+    return {'lambda': float(max(lam, 0.0))}
+rows = []
+for (hub, tou), g in rho_df.groupby(['hub','tou']):
+    g2 = g.dropna().sort_values('gap_m')
+    if len(g2) < 2: 
+        continue
+    lam = fit_rho_gap(g2['gap_m'].to_numpy(), g2['rho_emp'].to_numpy())['lambda']
+    lam = float(min(max(lam, 0.03), 0.30))  
+    rows.append({'hub':hub,'tou':tou,'lambda':lam})
+spark.createDataFrame(pd.DataFrame(rows)).write.mode("overwrite") \
+     .saveAsTable(f"{CATALOG['out_schema']}.ice_param_rho")
+
+# =========================
+# 6) FIT σ(τ): best of EXP or POWER (+ constraints) -> ice_param_sigma
+# =========================
+
+from scipy.optimize import curve_fit
+def fit_sigma_exp(tau, sig, k_grid=np.linspace(0.02,0.60,59)):
+    best=None
+    for k in k_grid:
+        X = np.column_stack([np.ones_like(tau), np.exp(-k*tau)])
+        beta, *_ = np.linalg.lstsq(X, sig, rcond=None)
+        sInf, A = beta
+        s0 = sInf + A
+        if sInf<=0 or s0<=sInf: continue
+        pred = X @ beta
+        err  = np.mean((pred - sig)**2)
+        if (best is None) or (err < best[0]): best=(err,k,sInf,s0)
+    if best is None:
+        m = float(np.mean(sig))
+        return {'form':'exp','sigma_0':m,'sigma_inf':m,'k':0.0,'err':1e9}
+    err,k,sInf,s0 = best
+    return {'form':'exp','sigma_0':float(s0),'sigma_inf':float(sInf),'k':float(k),'err':float(err)}
+def sigma_powerlaw_tau(tau, sigma_inf, a, b):
+    return sigma_inf + a * np.power(np.maximum(tau,1e-3), -np.maximum(b,1e-6))
+def fit_sigma_powerlaw(tau, sig):
+    s_tail = float(np.median(sig[-min(len(sig),5):]))
+    p0 = [max(1e-6, s_tail), max(1e-6, sig[0]-s_tail), 0.8]
+    bounds = ([0.0,0.0,0.05],[np.inf,np.inf,3.0])
+    popt,_ = curve_fit(sigma_powerlaw_tau, tau, sig, p0=p0, bounds=bounds, maxfev=10000)
+    pred = sigma_powerlaw_tau(tau, *popt)
+    err = float(np.mean((pred - sig)**2))
+    sigma_inf, a, b = map(float, popt)
+    return {'form':'power','sigma_inf':sigma_inf,'a':a,'b':b,'err':err}
+emp_tau = spark.table(f"{CATALOG['out_schema']}.ice_emp_vol_tau").toPandas()
+param_rows=[]
+for (hub,tou), g in emp_tau.groupby(['hub','tou']):
+    g2  = g.sort_values('tenor_m')
+    tau = g2['tenor_m'].to_numpy()
+    sig = g2['sigma_emp_t'].to_numpy()
+    if len(tau) < 3: 
+        continue
+    f_exp = fit_sigma_exp(tau, sig)
+    f_pow = fit_sigma_powerlaw(tau, sig)
+    best  = f_pow if f_pow['err'] < f_exp['err'] else f_exp
+    # constraints -> stronger near-tenor shape
+    if best['form']=='exp':
+        if best['sigma_0'] < 1.25*best['sigma_inf']:
+            best['sigma_0'] = 1.25*best['sigma_inf']
+        best['k'] = max(best['k'], 0.12)
+    else:
+        best['b'] = max(best['b'], 0.9)
+    best.update({'hub':hub,'tou':tou})
+    param_rows.append(best)
+spark.createDataFrame(pd.DataFrame(param_rows)).write.mode("overwrite").option("mergeSchema","true") \
+     .saveAsTable(f"{CATALOG['out_schema']}.ice_param_sigma")
+
+#=========================
+#7) SEASONALITY (robust median + uplift) -> ice_seasonal_multipliers
+#=========================
+
+emp_tau_m = spark.table(f"{CATALOG['out_schema']}.ice_emp_vol_tau_moy").toPandas()
+param      = spark.table(f"{CATALOG['out_schema']}.ice_param_sigma").toPandas()
+def sigma_param_at(fit, tau):
+    if fit.get('form','exp') == 'power':
+        return fit['sigma_inf'] + fit['a'] * (max(tau,1e-3))**(-fit['b'])
+    else:
+        return fit['sigma_inf'] + (fit['sigma_0'] - fit['sigma_inf']) * np.exp(-fit['k'] * tau)
+        
+# uplift = 1.10  # adjust 1.05–1.15 as needed
+rows=[]
+for (hub,tou), g in emp_tau_m.groupby(['hub','tou']):
+    pf = param[(param.hub==hub)&(param.tou==tou)]
+    if pf.empty: continue
+    fit = pf.iloc[0].to_dict()
+    g2 = g.dropna().copy()
+    g2['sigma_fit'] = g2['tenor_m'].apply(lambda t: sigma_param_at(fit, float(t)))
+    g2['ratio']     = g2['sigma_emp'] / g2['sigma_fit']
+    seas = g2.groupby('moy', as_index=True)['ratio'].median()
+    seas = seas.reindex(range(1,13), fill_value=1.0)
+    # seas = (seas/seas.mean()) * uplift
+    # seas = seas.clip(lower=0.6*uplift, upper=1.6*uplift)
+    S = seas.reset_index().rename(columns={'ratio':'S_m', 0:'S_m'})
+    S['hub']=hub; S['tou']=tou
+    rows.append(S)
+S_m = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=['moy','S_m','hub','tou'])
+spark.createDataFrame(S_m[['hub','tou','moy','S_m']]).write.mode("overwrite") \
+     .saveAsTable(f"{CATALOG['out_schema']}.ice_seasonal_multipliers")
+param_sigma_sdf = spark.table(f"{CATALOG['out_schema']}.ice_param_sigma").toPandas()
+param_rho_sdf   = spark.table(f"{CATALOG['out_schema']}.ice_param_rho").toPandas()
+S_m_sdf         = spark.table(f"{CATALOG['out_schema']}.ice_seasonal_multipliers").toPandas()
+
+# =========================
+# 8) HELPERS (params + alpha loaders)
+# =========================
+
+
+try:
+    calib_sdf  = spark.table('riskdev.ice_calibration').toPandas()
+except Exception:
+    calib_sdf  = pd.DataFrame(columns=['hub','tou','alpha'])
+try:
+    calib_grid = spark.table('riskdev.ice_calibration_tenor').toPandas()
+except Exception:
+    calib_grid = pd.DataFrame(columns=['hub','tou','tenor_m','alpha'])
+def get_fit(hub, tou):
+    r = param_sigma_sdf[(param_sigma_sdf.hub==hub)&(param_sigma_sdf.tou==tou)]
+    if r.empty: raise ValueError(f"No sigma params for {hub}/{tou}")
+    fit = r.iloc[0].to_dict()
+    rr = param_rho_sdf[(param_rho_sdf.hub==hub)&(param_rho_sdf.tou==tou)]
+    if rr.empty: raise ValueError(f"No rho params for {hub}/{tou}")
+    fit['lambda'] = float(rr.iloc[0]['lambda'])
+    return fit
+def get_Sm(hub,tou,moy:int):
+    r = S_m_sdf[(S_m_sdf.hub==hub)&(S_m_sdf.tou==tou)&(S_m_sdf.moy==moy)]
+    return float(r.iloc[0]['S_m']) if not r.empty else 1.0
+def sigma_of_tau(fit, tau_m, moy):
+    if fit.get('form','exp') == 'power':
+        base = float(fit['sigma_inf']) + float(fit['a']) * (max(tau_m,1e-3))**(-float(fit['b']))
+    else:
+        base = float(fit['sigma_inf']) + (float(fit['sigma_0']) - float(fit['sigma_inf'])) * math.exp(-float(fit['k'])*tau_m)
+    return base * get_Sm(fit['hub'], fit['tou'], moy)
+def rho_of_gap(fit, gap_m):
+    return math.exp(-float(fit['lambda']) * abs(gap_m))
+def get_alpha(hub:str, tou:str) -> float:
+    r = calib_sdf[(calib_sdf.hub==hub)&(calib_sdf.tou==tou)]
+    return float(r.iloc[0]['alpha']) if not r.empty else 1.0
+def get_alpha_by_tenor(hub:str, tou:str, tau0_months:float) -> float:
+    g = calib_grid[(calib_grid.hub==hub)&(calib_grid.tou==tou)]
+    if g.empty: return get_alpha(hub,tou)
+    i = (g['tenor_m'] - tau0_months).abs().idxmin()
+    return float(g.loc[i,'alpha'])
+    
+#=========================
+#9) VARIANCE FUNCTIONS (AR(1) + alpha)
+#=========================
+
+def hold_var_single(hub:str, tou:str, start_quote_date:date, delivery_month:date,
+                    qty:float=1.0, include_autocorr=False, phi=0.12,
+                    use_actual_days: bool=False, verbose: bool=False):
+    fit = get_fit(hub, tou); fit['hub']=hub; fit['tou']=tou
+    if delivery_month <= start_quote_date:
+        raise ValueError("delivery_month must be in the future")
+    # time-to-start in months
+    tau0 = (delivery_month.year - start_quote_date.year)*12 + (delivery_month.month - start_quote_date.month)
+    # H: trading-day count
+    if use_actual_days:
+        # ONE spark read to collect the actual quote days between start_quote_date and delivery_month for this hub/TOU.
+        qdf = (spark.table(f"{CATALOG['out_schema']}.ice_clean_prices")
+                 .select("quote_date")
+                 .where((F.col("hub")==hub)&(F.col("tou")==tou)&
+                        (F.col("delivery_month")==F.lit(delivery_month))&
+                        (F.col("quote_date")>=F.lit(start_quote_date)))
+                 .distinct().toPandas().sort_values('quote_date'))
+        H = int(qdf.shape[0])   # count actual trading days
+        if H < 10:                     # fallback
+            H = int(round(tau0 * 21))
+    else:
+        H = int(round(tau0 * 21))      # <<< synthetic grid (NO Spark job)
+    if verbose:
+        print("H =", H, "tau0 =", tau0)
+    var_sum = 0.0
+    moy = delivery_month.month
+    for i in range(H):
+        tau_i = max(tau0 - i/21.0, 0.01)   # tenor shrinks each day
+        sigma_i = sigma_of_tau(fit, tau_i, moy)  # σ(τ_i, MOY) with seasonality
+        var_sum += (sigma_i**2)   # sum daily variances
+    # if include_autocorr and abs(phi) > 1e-6:
+    #     infl = (1 + phi) / (1 - phi)
+    #     if verbose: print("AR(1) inflation factor =", infl)
+    #     var_sum *= infl
+    # alpha = get_alpha_by_tenor(hub, tou, float(tau0))
+    # var_sum *= (alpha**2)
+    # return (qty**2) * var_sum
+    return var_sum
+def hold_var_strip(hub:str, tou:str, start_quote_date:date, delivery_months:list, weights:list,
+                   qty:float=1.0, trading_days_per_month=21, include_autocorr=False, phi=0.12,
+                   horizon_months=12, verbose:bool=False):
+    assert len(delivery_months)==len(weights) and len(weights)>0
+    fit = get_fit(hub, tou); fit['hub']=hub; fit['tou']=tou
+    taus0 = np.array([(m.year - start_quote_date.year)*12 + (m.month - start_quote_date.month)
+                      for m in delivery_months], dtype=float)
+    if np.any(taus0<=0): 
+        raise ValueError("All delivery months must be in the future vs start date")
+    moys  = np.array([m.month for m in delivery_months], dtype=int)
+    w     = np.array(weights, dtype=float)
+    step = 1.0 / trading_days_per_month
+    H = int(math.ceil((horizon_months if horizon_months is not None else float(np.max(taus0))) / step))
+    var_total = 0.0
+    for i in range(H):
+        taus_i = np.maximum(taus0 - i*step, 0.01)
+        sig = np.array([sigma_of_tau(fit, t, m) for t,m in zip(taus_i, moys)])
+        R = np.ones((len(sig), len(sig)))
+        for a in range(len(sig)):
+            for b in range(a+1,len(sig)):
+                R[a,b] = R[b,a] = rho_of_gap(fit, abs(taus_i[b]-taus_i[a]))
+        Sigma = np.outer(sig, sig) * R
+        var_total += (qty**2) * float(w @ Sigma @ w)
+    # if include_autocorr and abs(phi) > 1e-6:
+    #     infl = (1 + phi) / (1 - phi)
+    #     var_total *= infl
+    # eff_tau0 = float(horizon_months if horizon_months is not None else np.max(taus0))
+    # alpha = get_alpha_by_tenor(hub, tou, eff_tau0)
+    # var_total *= (alpha**2)
+    return var_total
+
+#=====BOOTSTRAP VAR FROM DELIVERY MONTHS=====
+
+import pandas as pd
+def realized_var_single_bootstrap_from_df(
+    df_pandas: pd.DataFrame,
+    lookahead_months: int = 12,
+    min_days: int = 150
+) -> pd.DataFrame:
+    df = df_pandas.copy()
+    out = []
+    print(f"Running bootstrap: {len(df)} rows, lookahead={lookahead_months}m, min_days={min_days}")
+    print("Columns available:", df.columns.tolist())
+    if df.empty:
+        print("❌ Input dataframe is empty.")
+        return pd.DataFrame()
+    for s, gg in df.groupby('quote_date'):
+        cand = gg.loc[
+            (gg['tenor_m'] >= lookahead_months - 2) &
+            (gg['tenor_m'] <= lookahead_months + 2)
+        ]
+        if cand.empty:
+            continue
+        dm = cand.sort_values('tenor_m').iloc[0]['delivery_month']
+        path = df[(df['delivery_month'] == dm) & (df['quote_date'] >= s)].sort_values('quote_date')
+        if len(path) < min_days:
+            continue
+        var_sum = float(np.mean(path['ret'] ** 2) * len(path))
+        out.append({'start': s, 'delivery_month': dm, 'var_sum': var_sum})
+    if not out:
+        print("⚠️ No valid paths found — likely insufficient forward months or min_days too high.")
+    else:
+        print(f"✅ {len(out)} bootstrap paths computed.")
+    return pd.DataFrame(out)
+g_np15_hlh = (
+    spark.table(f"{CATALOG['out_schema']}.ice_same_delivery_returns")
+    .where((F.col("hub")=="NP15") & (F.col("tou")=="HLH") & (F.col("tenor_m")>0))
+    .toPandas()
+)
+boot = realized_var_single_bootstrap_from_df(g_np15_hlh, lookahead_months=12, min_days=100)
+print(boot.head())
+
+if not boot.empty:
+    boot['std'] = np.sqrt(boot['var_sum'])
+    print(boot[['var_sum', 'std']].describe())
+else:
+    print("⚠️ Bootstrap returned empty DataFrame — check tenor_m horizon or min_days filter.")
+    
+SCHEMA = "riskdev"   # <- if your tables are in another db, change this one word
+# Set current database so 2-part names work
+spark.sql(f"USE `{SCHEMA}`")
+# Safe tableExists that avoids the spark_catalog single-part error
+def table_exists(schema: str, name: str) -> bool:
+    return bool(spark._jsparkSession.catalog().tableExists(schema, name))
+def tbl(name: str) -> str:
+    return f"`{SCHEMA}`.`{name}`"
+print("Using schema:", SCHEMA)
+print("returns exists? ->", table_exists(SCHEMA, "ice_same_delivery_returns"))
+# If False, list to confirm where it really is
+if not table_exists(SCHEMA, "ice_same_delivery_returns"):
+    display(spark.sql("SHOW DATABASES"))
+    display(spark.sql(f"SHOW TABLES IN `{SCHEMA}`"))
+    raise RuntimeError("ice_same_delivery_returns not in the schema you set. "
+                       "Change SCHEMA above to where your tables really are.")
+import numpy as np, pandas as pd
+import pyspark.sql.functions as F
+from datetime import date
+def month_add(d: date, m: int) -> date:
+    y = d.year + (d.month-1 + m)//12
+    mo = (d.month-1 + m)%12 + 1
+    return date(y, mo, 1)
+def bootstrap_var_mean_from_df(df: pd.DataFrame, lookahead_months=14, min_days=120) -> float:
+    out=[]
+    for s, gg in df.groupby('quote_date'):
+        cand = gg[(gg['tenor_m']>=lookahead_months-1) & (gg['tenor_m']<=lookahead_months+1)]
+        if cand.empty: continue
+        dm = cand.sort_values('tenor_m').iloc[0]['delivery_month']
+        path = df[(df.delivery_month==dm) & (df.quote_date>=s)].sort_values('quote_date')
+        if len(path) < min_days: continue
+        out.append(float((path['ret']**2).mean() * len(path)))
+    return float(np.mean(out)) if out else float('nan')
+TENOR   = 14
+N_START = 12          
+MIN_DAYS= 120
+PHI     = 0.12
+def compute_alpha_simple(hub: str, tou: str, tenor: int = TENOR,
+                         n_starts: int = N_START, phi: float = PHI) -> float:
+    t0 = pd.Timestamp.now()
+    print(f"[{hub}/{tou}] reading returns…", flush=True)
+    df = (spark.table(tbl("ice_same_delivery_returns"))
+            .where((F.col("hub")==hub) & (F.col("tou")==tou))
+            .where(F.col("quote_date") >= F.lit("2019-01-01"))  # speed filter
+            .select("quote_date","delivery_month","tenor_m","ret")
+            .toPandas())
+    print(f"[{hub}/{tou}] rows={len(df):,}, unique quote days={df['quote_date'].nunique():,}", flush=True)
+    if df.empty: 
+        return 1.0
+    print(f"[{hub}/{tou}] bootstrap @ {tenor}M…", flush=True)
+    boot_mean = bootstrap_var_mean_from_df(df, lookahead_months=tenor, min_days=MIN_DAYS)
+    uq = df['quote_date'].drop_duplicates().sort_values().tolist()
+    stride = max(1, len(uq)//n_starts)
+    starts = uq[::stride][:n_starts]
+    print(f"[{hub}/{tou}] modeling {len(starts)} starts @ {tenor}M…", flush=True)
+    mvals=[]
+    for k, s in enumerate(starts, 1):
+        s_date = pd.to_datetime(s).date()
+        dm     = month_add(s_date, tenor)
+        v      = hold_var_single(hub, tou, s_date, dm,
+                                 include_autocorr=True, phi=phi,
+                                 use_actual_days=False, verbose=False)
+        mvals.append(v)
+        if k % 4 == 0:
+            print(f"  progress: {k}/{len(starts)}", flush=True)
+    model_mean = float(np.mean(mvals)) if mvals else float('nan')
+    alpha = (boot_mean/model_mean)**0.5 if (np.isfinite(boot_mean) and np.isfinite(model_mean) and model_mean>0) else 1.0
+    dt = (pd.Timestamp.now() - t0).total_seconds()
+    print(f"[{hub}/{tou}] alpha={alpha:.3f} (took {dt:.1f}s)", flush=True)
+    return float(alpha)
+rows=[]
+for hub,tou in [('NP15','HLH')]:  
+    a = compute_alpha_simple(hub, tou)
+    rows.append({'hub':hub,'tou':tou,'alpha':a})
+alpha_df = pd.DataFrame(rows)
+spark.createDataFrame(alpha_df).write.mode('overwrite').saveAsTable(tbl("ice_calibration"))
+display(alpha_df)
+for TENOR in [6, 12, 24]:
+    a = compute_alpha_simple('NP15', 'HLH', tenor=TENOR)
+    print(f"TENOR={TENOR}M -> alpha={a:.3f}")
+
+# =========================
+# 11) VOLATILITY TABLES (single, quarterly, semiannual/annual)
+# =========================
+
+import pandas as pd
+from datetime import date, timedelta
+# === FAST PRELOADS ===
+print("Loading all required tables once into memory...")
+# Load all data you’ll need for volatility calculations
+param_sigma_sdf = spark.table(f"{CATALOG['out_schema']}.ice_param_sigma").toPandas()
+param_rho_sdf   = spark.table(f"{CATALOG['out_schema']}.ice_param_rho").toPandas()
+ice_emp_vol_tau = spark.table(f"{CATALOG['out_schema']}.ice_emp_vol_tau").toPandas()
+ice_same_delivery_returns = spark.table(f"{CATALOG['out_schema']}.ice_same_delivery_returns").toPandas()
+print(f"Sigma params: {len(param_sigma_sdf):,} rows | "
+      f"Rho params: {len(param_rho_sdf):,} rows | "
+      f"Emp vol tau: {len(ice_emp_vol_tau):,} rows | "
+      f"Same-delivery returns: {len(ice_same_delivery_returns):,} rows")
+print("All tables cached in memory — proceeding with volatility generation...")
+
+def annualized_vol(var):
+    return (var ** 0.5)
+
+today = date.today()
+start_quote = today
+years_ahead = 5
+
+# Build list of delivery months (next 5 years + rest of current)
+delivery_months = []
+for y in range(today.year, today.year + years_ahead + 1):
+    for m in range(1, 13):
+        delivery_months.append(date(y, m, 1))
+delivery_months = [d for d in delivery_months if d > today]
+# Load calibration params
+param_sigma = spark.table(f"{CATALOG['out_schema']}.ice_param_sigma").toPandas()
+param_rho   = spark.table(f"{CATALOG['out_schema']}.ice_param_rho").toPandas()
+S_m         = spark.table(f"{CATALOG['out_schema']}.ice_seasonal_multipliers").toPandas()
+calib       = spark.table(f"{CATALOG['out_schema']}.ice_calibration").toPandas()
+param_sigma_sdf = param_sigma
+param_rho_sdf   = param_rho
+# Helper wrapper to reuse fit object
+def hold_var_strip_cached(fit, hub, tou, start_quote_date, delivery_months, weights):
+    return hold_var_strip(hub, tou, start_quote_date, delivery_months, weights)
+
+# === 10.1 SINGLE MONTH VARIANCE ===
+rows_single = []
+for hub in ["NP15", "SP15"]:
+    for tou in ["HLH", "LLH"]:
+        for dm in delivery_months:
+            try:
+                var_val = hold_var_single(hub, tou, start_quote, dm, use_actual_days=False)
+                if var_val is None or not np.isfinite(var_val):  # <-- new safety check
+                    continue
+                vol_val = annualized_vol(var_val)
+                vol_1m  = vol_val * np.sqrt(1/12)   # convert annualized σ → 1-month σ
+                rows_single.append({
+                    "hub": hub,
+                    "strip_type": "single",
+                    "quote_date": start_quote,
+                    "tou": tou,
+                    "contract_date": dm,
+                    "volatility_annualized": float(vol_val),
+                    "volatility_1m": float(vol_1m),
+                })
+            except Exception as e:
+                print(f"⚠️ Skipped {hub}-{tou}-{dm}: {e}")
+                continue
+                
+# --- Defensive check before creating DataFrame
+if not rows_single:
+    raise RuntimeError("No valid single-month volatility rows generated. Check hold_var_single().")
+df_single = pd.DataFrame(rows_single)
+print(f"✅ Created single-month DataFrame with {len(df_single)} rows.")
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG['out_schema']}.ice_vol_monthly")
+spark.createDataFrame(df_single).write.mode("overwrite").saveAsTable(f"{CATALOG['out_schema']}.ice_vol_monthly")
+
+# === 10.2 QUARTERLY STRIPS ===
+quarters = {
+    "Q1": [1, 2, 3],
+    "Q2": [4, 5, 6],
+    "Q3": [7, 8, 9],
+    "Q4": [10, 11, 12],
+}
+rows_quarter = []
+fit_cache = {}
+import time
+start_time = time.time()
+count = 0
+for hub in ["NP15", "SP15"]:
+    for tou in ["HLH", "LLH"]:
+      
+        if (hub, tou) not in fit_cache:
+            fit_cache[(hub, tou)] = get_fit(hub, tou)
+        fit = fit_cache[(hub, tou)]
+        for y in range(today.year, today.year + years_ahead + 1):
+            for qname, months in quarters.items():
+                dms = [date(y, m, 1) for m in months if date(y, m, 1) > today]
+                if not dms:
+                    continue
+                weights = [1/len(dms)] * len(dms)
+                try:
+                    var_q = hold_var_strip_cached(fit, hub, tou, start_quote, dms, weights)
+                    # Model variance for the quarter strip
+                    var_q = hold_var_strip_cached(fit, hub, tou, start_quote, dms, weights)
+                    vol_ann = annualized_vol(var_q)
+                  
+                    t_years = 3 / 12  # 3 months = 0.25 years
+                    vol_qtr = vol_ann * np.sqrt(t_years)
+                    rows_quarter.append({
+                        "hub": hub,
+                        "strip_type": "quarter",
+                        "quote_date": start_quote,
+                        "tou": tou,
+                        "quarter_name": f"{qname}-{y}",
+                        "period": f"{y}-{str(months[0]).zfill(2)}-01",  # e.g., 2026-01-01, 2026-04-01, etc.
+                        "volatility_annualized": float(vol_ann),
+                        "volatility_quarter": float(vol_qtr)
+                    })
+                    count += 1
+                    if count % 10 == 0:
+                        elapsed = time.time() - start_time
+                        print(f"✅ {count} quarterly strips processed in {elapsed:.1f}s", flush=True)
+                except Exception as e:
+                    print(f"⚠️ Skipped {hub}/{tou}/{qname}-{y}: {e}")
+                    continue
+
+df_quarter = pd.DataFrame(rows_quarter)
+spark.sql(f"DROP TABLE IF EXISTS {CATALOG['out_schema']}.ice_vol_quarter")
+spark.createDataFrame(df_quarter).write.mode("overwrite").saveAsTable(f"{CATALOG['out_schema']}.ice_vol_quarter")
+
+# === 10.3 SEMIANNUAL + ANNUAL ===
+rows_semi = []
+rows_annual = []
+vol_dict_semi = {}
+vol_dict_ann = {}
+# Cache fit per hub/TOU
+fit_cache = {}
+for hub in ["NP15", "SP15"]:
+    for tou in ["HLH", "LLH"]:
+        # cache fit once per hub/TOU
+        key = (hub, tou)
+        if key not in fit_cache:
+            fit_cache[key] = get_fit(hub, tou)
+        fit = fit_cache[key]
+        for y in range(today.year, today.year + years_ahead + 1):
+            # H1 = Jan–Jun
+            dms_H1 = [date(y, m, 1) for m in range(1, 7) if date(y, m, 1) > today]
+            # H2 = Jul–Dec
+            dms_H2 = [date(y, m, 1) for m in range(7, 13) if date(y, m, 1) > today]
+            # Full year
+            dms_1Y = [date(y, m, 1) for m in range(1, 13) if date(y, m, 1) > today]
+            
+#semi-annual
+            if dms_H1:
+                vol_H1_ann = annualized_vol(hold_var_strip_cached(fit, hub, tou, start_quote, dms_H1, [1/len(dms_H1)] * len(dms_H1)))
+                t_years = 6 / 12
+                vol_H1 = vol_H1_ann * np.sqrt(t_years)
+                rows_semi.append({
+                    "hub": hub,
+                    "strip_type": "semiannual",
+                    "period": f"H1-{y}",
+                    "quote_date": start_quote,
+                    "tou": tou,
+                    "volatility_annualized": float(vol_H1_ann),
+                    "volatility_semiannual": float(vol_H1)
+                })
+                vol_dict_semi[(hub, y, tou, "H1")] = vol_H1_ann
+            if dms_H2:
+                vol_H2_ann = annualized_vol(hold_var_strip_cached(fit, hub, tou, start_quote, dms_H2, [1/len(dms_H2)] * len(dms_H2)))
+                t_years = 6 / 12
+                vol_H2 = vol_H2_ann * np.sqrt(t_years)
+                rows_semi.append({
+                    "hub": hub,
+                    "strip_type": "semiannual",
+                    "period": f"H2-{y}",
+                    "quote_date": start_quote,
+                    "tou": tou,
+                    "volatility_annualized": float(vol_H2_ann),
+                    "volatility_semiannual": float(vol_H2)
+                })
+                vol_dict_semi[(hub, y, tou, "H2")] = vol_H2_ann
+                
+ # --- ANNUAL ---
+            if dms_1Y:
+                vol_1Y_ann = annualized_vol(hold_var_strip_cached(fit, hub, tou, start_quote, dms_1Y, [1/len(dms_1Y)] * len(dms_1Y)))
+                rows_annual.append({
+                    "hub": hub,
+                    "strip_type": "annual",
+                    "period": f"FY-{y}",
+                    "quote_date": start_quote,
+                    "tou": tou,
+                    "volatility_annualized": float(vol_1Y_ann)
+                })
+                vol_dict_ann[(hub, y, tou)] = vol_1Y_ann
+                
+# --- Compute ATC vols after both HLH and LLH are calculated ---
+w_hlh = .57
+w_llh = .43
+rho = 0.8  # correlation assumption
+
+# ANNUAL ATC
+for hub in ["NP15", "SP15"]:
+    for y in range(today.year, today.year + years_ahead + 1):
+        key_hlh = (hub, y, "HLH")
+        key_llh = (hub, y, "LLH")
+        if key_hlh in vol_dict_ann and key_llh in vol_dict_ann:
+            vol_HLH = vol_dict_ann[key_hlh]
+            vol_LLH = vol_dict_ann[key_llh]
+            vol_ATC = np.sqrt((w_hlh**2)*(vol_HLH**2) + (w_llh**2)*(vol_LLH**2) + 2*w_hlh*w_llh*rho*vol_HLH*vol_LLH)
+            rows_annual.append({
+                "hub": hub,
+                "strip_type": "annual",
+                "period": f"FY-{y}",
+                "quote_date": start_quote,
+                "tou": "ATC",
+                "volatility_annualized": float(vol_ATC)
+            })
+df_semi = pd.DataFrame(rows_semi)
+df_annual = pd.DataFrame(rows_annual)
+spark.sql("DROP TABLE IF EXISTS riskdev.ice_vol_semiannual")
+spark.sql("DROP TABLE IF EXISTS riskdev.ice_vol_annual")
+spark.createDataFrame(df_semi).coalesce(1).write.mode("overwrite").saveAsTable("riskdev.ice_vol_semiannual")
+spark.createDataFrame(df_annual).coalesce(1).write.mode("overwrite").saveAsTable("riskdev.ice_vol_annual")
+
+# display(spark.table(f"{CATALOG['out_schema']}.ice_vol_monthly"))
+# display(spark.table(f"{CATALOG['out_schema']}.ice_vol_quarter"))
+display(spark.table(f"{CATALOG['out_schema']}.ice_vol_annual"))
+
+from pyspark.sql import functions as F
+import numpy as np
+import pandas as pd
+# === STEP 1: Load and clean ERMP data ===
+ermp = spark.table("riskdev.hourlyprofilebycontract")
+ermp_clean = (
+    ermp.select(
+        "Date",
+        "hlh",
+        "llh",
+        "WHLoadTotal",
+        "hedgepct"
+    )
+    .withColumn("hub", F.lit("NP15"))  #asssumed - hub was not referenced in the original ERMP data
+    .withColumn("delivery_month", F.date_trunc("month", F.col("Date")))
+    .filter(F.col("Date") > F.current_date())
+    .withColumn("unhedged_pct", 1 - F.col("hedgepct"))
+    .withColumn("Unhedged_MWh", F.col("WHLoadTotal") * (1 - F.col("hedgepct")))
+    .withColumn(
+        "tou",
+        F.when(F.col("hlh") == 1, F.lit("HLH"))
+         .when(F.col("llh") == 1, F.lit("LLH"))
+         .otherwise(F.lit(None))
+    )
+    .filter(F.col("tou").isNotNull())
+)
+display(ermp_clean)
+
+from pyspark.sql import functions as F
+ermp_monthly = (
+    ermp
+    .withColumn("delivery_month", F.date_trunc("month", F.col("Date")))
+    .withColumn("hub", F.lit("NP15"))                      
+    .withColumn("unhedged_mwh", F.col("WHLoadTotal") * (1 - F.col("hedgepct")))
+    .withColumn(
+        "tou",
+        F.when(F.col("hlh") == 1, "HLH")
+         .when(F.col("llh") == 1, "LLH")
+         .otherwise(None)
+    )
+    .filter(F.col("tou").isNotNull())
+    # Group to same level as volatility table
+    .groupBy("hub", "delivery_month", "tou")
+    .agg(F.sum("unhedged_mwh").alias("Unhedged_MWh"))
+)
+#display(ermp_monthly.limit(100))
+vol = (
+    spark.table("riskdev.ice_vol_monthly")
+    .select("hub", "tou", "contract_date", "volatility_1m")
+    .withColumnRenamed("contract_date", "period")
+)
+ermp_with_vol = (
+    ermp_monthly.alias("e")
+    .join(
+        vol.alias("v"),
+        (F.col("e.hub") == F.col("v.hub")) &
+        (F.col("e.tou") == F.col("v.tou")) &
+        (F.col("e.delivery_month") == F.col("v.period")),
+        "left"
+    )
+    .select(
+        "e.hub", "e.tou", "e.delivery_month",
+        "e.Unhedged_MWh", "v.volatility_1m"
+    )
+)
+display(ermp_with_vol)
+
+from pyspark.sql import functions as F
+# Step 1: Load ICE forward prices 
+ice_price_latest = (
+    spark.table("riskdev.ice_clean_prices")
+    .filter(F.col("quote_date") == F.expr("(SELECT max(quote_date) FROM riskdev.ice_clean_prices)"))
+    .select("hub", "tou", "delivery_month", "settle")
+    .withColumnRenamed("settle", "price")
+)
+
+# Step 2: Join ERMP + volatility table with ICE prices
+ermp_with_price = (
+    ermp_with_vol.alias("e")
+    .join(
+        ice_price_latest.alias("p"),
+        (F.col("e.hub") == F.col("p.hub")) &
+        (F.col("e.tou") == F.col("p.tou")) &
+        (F.col("e.delivery_month") == F.col("p.delivery_month")),
+        "left"
+    )
+    .select(
+        "e.hub",
+        "e.tou",
+        "e.delivery_month",
+        "e.Unhedged_MWh",
+        "e.volatility_1m",
+        "p.price"
+    )
+)
+# Step 3: Compute monthly Value at Risk (99% confidence, 1.645 z-score)
+# VaR = Unhedged_MWh * price * volatility * 1.645
+ermp_var = (
+    ermp_with_price
+    .withColumn("VaR", F.col("Unhedged_MWh") * F.col("price") * F.col("volatility_1m") * 1.645)
+    .select("hub", "tou", "delivery_month", "Unhedged_MWh", "price", "volatility_1m", "VaR")
+)
+
+# Display results
+display(ermp_var)
+import matplotlib.pyplot as plt
+# Convert to Pandas for plotting
+df = ermp_var.toPandas()
+# Convert delivery_month to datetime for proper sorting
+df['delivery_month'] = pd.to_datetime(df['delivery_month'])
+# Sort by date
+df = df.sort_values('delivery_month')
+# Create the plot
+plt.figure(figsize=(12, 6))
+# Plot HLH and LLH as separate lines
+for tou_label in ['HLH', 'LLH']:
+    subset = df[df['tou'] == tou_label]
+    plt.plot(subset['delivery_month'], subset['VaR'] / 1e6, marker='o', label=tou_label)  # convert to millions
+plt.title('Monthly Value at Risk (VAR) by TOU')
+plt.xlabel('Delivery Month')
+plt.ylabel('VAR (Million $)')
+plt.legend(title='TOU')
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.tight_layout()
+plt.show()
+
+
