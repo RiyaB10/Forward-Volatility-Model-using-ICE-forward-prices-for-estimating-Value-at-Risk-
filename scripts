@@ -19,7 +19,7 @@ import pyspark.sql.functions as F
 from pyspark.sql import Window
 
 # =========================
-# 1) CLEAN & MAP → riskdev.ice_clean_prices
+# 1) CLEAN & MAP → ice_clean_prices
 # =========================
 
 from datetime import date, timedelta
@@ -82,7 +82,7 @@ display(
 )
 
 # =========================
-# 2) SAME-DELIVERY RETURNS -> riskdev.ice_same_delivery_returns
+# 2) SAME-DELIVERY RETURNS -> ice_same_delivery_returns
 # =========================
 #returns for the same delivery contract across quote days
 
@@ -374,7 +374,7 @@ def realized_var_single_bootstrap_from_df(
     print(f"Running bootstrap: {len(df)} rows, lookahead={lookahead_months}m, min_days={min_days}")
     print("Columns available:", df.columns.tolist())
     if df.empty:
-        print("❌ Input dataframe is empty.")
+        print("Input dataframe is empty.")
         return pd.DataFrame()
     for s, gg in df.groupby('quote_date'):
         cand = gg.loc[
@@ -390,9 +390,9 @@ def realized_var_single_bootstrap_from_df(
         var_sum = float(np.mean(path['ret'] ** 2) * len(path))
         out.append({'start': s, 'delivery_month': dm, 'var_sum': var_sum})
     if not out:
-        print("⚠️ No valid paths found — likely insufficient forward months or min_days too high.")
+        print(" No valid paths found — likely insufficient forward months or min_days too high.")
     else:
-        print(f"✅ {len(out)} bootstrap paths computed.")
+        print(f"{len(out)} bootstrap paths computed.")
     return pd.DataFrame(out)
 g_np15_hlh = (
     spark.table(f"{CATALOG['out_schema']}.ice_same_delivery_returns")
@@ -406,7 +406,7 @@ if not boot.empty:
     boot['std'] = np.sqrt(boot['var_sum'])
     print(boot[['var_sum', 'std']].describe())
 else:
-    print("⚠️ Bootstrap returned empty DataFrame — check tenor_m horizon or min_days filter.")
+    print("Bootstrap returned empty DataFrame — check tenor_m horizon or min_days filter.")
     
 SCHEMA = "riskdev"   # <- if your tables are in another db, change this one word
 # Set current database so 2-part names work
@@ -553,14 +553,14 @@ for hub in ["NP15", "SP15"]:
                     "volatility_1m": float(vol_1m),
                 })
             except Exception as e:
-                print(f"⚠️ Skipped {hub}-{tou}-{dm}: {e}")
+                print(f"Skipped {hub}-{tou}-{dm}: {e}")
                 continue
                 
 # --- Defensive check before creating DataFrame
 if not rows_single:
     raise RuntimeError("No valid single-month volatility rows generated. Check hold_var_single().")
 df_single = pd.DataFrame(rows_single)
-print(f"✅ Created single-month DataFrame with {len(df_single)} rows.")
+print(f"Created single-month DataFrame with {len(df_single)} rows.")
 spark.sql(f"DROP TABLE IF EXISTS {CATALOG['out_schema']}.ice_vol_monthly")
 spark.createDataFrame(df_single).write.mode("overwrite").saveAsTable(f"{CATALOG['out_schema']}.ice_vol_monthly")
 
@@ -609,9 +609,9 @@ for hub in ["NP15", "SP15"]:
                     count += 1
                     if count % 10 == 0:
                         elapsed = time.time() - start_time
-                        print(f"✅ {count} quarterly strips processed in {elapsed:.1f}s", flush=True)
+                        print(f"{count} quarterly strips processed in {elapsed:.1f}s", flush=True)
                 except Exception as e:
-                    print(f"⚠️ Skipped {hub}/{tou}/{qname}-{y}: {e}")
+                    print(f"Skipped {hub}/{tou}/{qname}-{y}: {e}")
                     continue
 
 df_quarter = pd.DataFrame(rows_quarter)
